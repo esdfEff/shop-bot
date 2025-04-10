@@ -17,11 +17,18 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 
 	updates := bot.GetUpdatesChan(u)
 
+	// Переменная для хранения состояния
+	type clientState struct {
+		lastMessageID int // ID последнего отправленного сообщения
+	}
+	state := clientState{}
+
 	for update := range updates {
 		// Обработка текстовых сообщений
 		if update.Message != nil {
 			userID := update.Message.From.ID
 			nameTag := update.Message.From.UserName
+			chatID := update.Message.Chat.ID
 
 			// Добавляем пользователя в базу
 			if err := db.AddUser(models.User{ID: userID, NameTag: nameTag}); err != nil {
@@ -30,39 +37,80 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 
 			switch update.Message.Text {
 			case "/start":
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Добро пожаловать в магазин! Выберите опцию:")
+				// Удаляем предыдущее сообщение, если оно есть
+				if state.lastMessageID != 0 {
+					deleteMsg := tgbotapi.NewDeleteMessage(chatID, state.lastMessageID)
+					if _, err := bot.Send(deleteMsg); err != nil {
+						log.Println("Failed to delete message:", err)
+					}
+				}
+
+				// Отправляем сообщение с inline-кнопками
+				msg := tgbotapi.NewMessage(chatID, "Добро пожаловать в магазин! Выберите опцию:")
 				msg.ReplyMarkup = clientMenu()
-				bot.Send(msg)
-
-			case "Товары":
-				goods, err := db.GetGoods()
+				sentMsg, err := bot.Send(msg)
 				if err != nil {
-					log.Println("Failed to get goods:", err)
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при получении товаров.")
-					bot.Send(msg)
+					log.Println("Failed to send message:", err)
 					continue
 				}
-				if len(goods) == 0 {
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Товаров пока нет.")
-					bot.Send(msg)
+				// Сохраняем ID отправленного сообщения
+				state.lastMessageID = sentMsg.MessageID
+
+			default:
+				// Если пользователь отправил что-то, что не является командой
+				msg := tgbotapi.NewMessage(chatID, "Пожалуйста, используйте кнопки для взаимодействия.")
+				sentMsg, err := bot.Send(msg)
+				if err != nil {
+					log.Println("Failed to send message:", err)
 					continue
 				}
+				// Сохраняем ID нового сообщения
+				state.lastMessageID = sentMsg.MessageID
+			}
+		}
 
-				// Создаем сообщение с текстом
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Доступные товары:")
-				var buttons [][]tgbotapi.InlineKeyboardButton
-				for _, good := range goods {
-					// Создаем кнопку для каждого товара
-					buttonText := fmt.Sprintf("%s (%.2f ₽)", good.Name, good.Value)
-					buttonData := fmt.Sprintf("good_%d", good.ID)
-					buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
-						tgbotapi.NewInlineKeyboardButtonData(buttonText, buttonData),
-					))
+		// Обработка нажатий на inline-кнопки
+		if update.CallbackQuery != nil {
+			callback := update.CallbackQuery
+			chatID := callback.Message.Chat.ID
+			userID := callback.From.ID
+			var response string
+			var msg tgbotapi.MessageConfig
+
+			// Удаляем предыдущее сообщение (например, меню или список товаров/услуг)
+			if callback.Message.MessageID != 0 {
+				deleteMsg := tgbotapi.NewDeleteMessage(chatID, callback.Message.MessageID)
+				if _, err := bot.Send(deleteMsg); err != nil {
+					log.Println("Failed to delete message:", err)
 				}
-				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
-				bot.Send(msg)
+				// Обновляем state.lastMessageID, так как сообщение удалено
+				if state.lastMessageID == callback.Message.MessageID {
+					state.lastMessageID = 0
+				}
+			}
 
-			case "Профиль":
+			switch callback.Data {
+			case "back_to_menu":
+				// Возвращаемся к главному меню
+				response = "Добро пожаловать в магазин! Выберите опцию:"
+				msg = tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = clientMenu()
+
+			case "catalog":
+				// Показываем inline-кнопки для выбора: Товары или Услуги
+				response = "Выберите категорию:"
+				msg = tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Товары", "show_goods"),
+						tgbotapi.NewInlineKeyboardButtonData("Услуги", "show_services"),
+					),
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					),
+				)
+
+			case "profile":
 				// Получаем баланс пользователя
 				balance, err := db.GetUserBalance(userID)
 				if err != nil {
@@ -78,7 +126,7 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 				}
 
 				// Форматируем профиль
-				profileText := fmt.Sprintf(
+				response = fmt.Sprintf(
 					"*Ваш баланс:* %.2f ₽ 💰\n\n"+
 						"🆔 ID: %d\n"+
 						"🛍️ Количество покупок: %d\n\n"+
@@ -87,12 +135,8 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 					userID,
 					len(history),
 				)
-
-				// Создаем сообщение с текстом
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, profileText)
+				msg = tgbotapi.NewMessage(chatID, response)
 				msg.ParseMode = "Markdown"
-
-				// Добавляем inline-кнопки
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 					tgbotapi.NewInlineKeyboardRow(
 						tgbotapi.NewInlineKeyboardButtonData("💸 Пополнить баланс", "top_up_balance"),
@@ -106,59 +150,112 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 					tgbotapi.NewInlineKeyboardRow(
 						tgbotapi.NewInlineKeyboardButtonData("📜 Активировать купон", "activate_coupon"),
 					),
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					),
 				)
 
-				// Отправляем сообщение
-				bot.Send(msg)
+			case "info":
+				response = "Напишите @SupportBot для помощи."
+				msg = tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					),
+				)
 
-			case "Услуги":
+			case "show_goods":
+				goods, err := db.GetGoods()
+				if err != nil {
+					log.Println("Failed to get goods:", err)
+					response = "Ошибка при получении товаров."
+				} else if len(goods) == 0 {
+					response = "Товаров пока нет."
+				} else {
+					response = "Доступные товары:"
+					var buttons [][]tgbotapi.InlineKeyboardButton
+					for _, good := range goods {
+						buttonText := fmt.Sprintf("%s (%.2f ₽)", good.Name, good.Value)
+						buttonData := fmt.Sprintf("good_%d", good.ID)
+						buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData(buttonText, buttonData),
+						))
+					}
+					// Добавляем кнопку "Назад"
+					buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					))
+					msg = tgbotapi.NewMessage(chatID, response)
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+					sentMsg, err := bot.Send(msg)
+					if err != nil {
+						log.Println("Failed to send message:", err)
+						continue
+					}
+					// Сохраняем ID нового сообщения
+					state.lastMessageID = sentMsg.MessageID
+					// Подтверждаем обработку callback
+					callbackConfig := tgbotapi.NewCallback(callback.ID, "")
+					bot.Send(callbackConfig)
+					continue
+				}
+
+			case "show_services":
 				services, err := db.GetServices()
 				if err != nil {
 					log.Println("Failed to get services:", err)
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при получении услуг.")
-					bot.Send(msg)
-					continue
-				}
-				if len(services) == 0 {
-					msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Услуг пока нет.")
-					bot.Send(msg)
-					continue
-				}
-
-				// Создаем сообщение с текстом
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Доступные услуги:")
-				var buttons [][]tgbotapi.InlineKeyboardButton
-				for _, service := range services {
-					// Создаем кнопку для каждой услуги
-					buttonText := fmt.Sprintf("%s (%.2f ₽)", service.Name, service.Value)
-					buttonData := fmt.Sprintf("service_%d", service.ID)
+					response = "Ошибка при получении услуг."
+				} else if len(services) == 0 {
+					response = "Услуг пока нет."
+				} else {
+					response = "Доступные услуги:"
+					var buttons [][]tgbotapi.InlineKeyboardButton
+					for _, service := range services {
+						buttonText := fmt.Sprintf("%s (%.2f ₽)", service.Name, service.Value)
+						buttonData := fmt.Sprintf("service_%d", service.ID)
+						buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData(buttonText, buttonData),
+						))
+					}
+					// Добавляем кнопку "Назад"
 					buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
-						tgbotapi.NewInlineKeyboardButtonData(buttonText, buttonData),
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
 					))
+					msg = tgbotapi.NewMessage(chatID, response)
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+					sentMsg, err := bot.Send(msg)
+					if err != nil {
+						log.Println("Failed to send message:", err)
+						continue
+					}
+					// Сохраняем ID нового сообщения
+					state.lastMessageID = sentMsg.MessageID
+					// Подтверждаем обработку callback
+					callbackConfig := tgbotapi.NewCallback(callback.ID, "")
+					bot.Send(callbackConfig)
+					continue
 				}
-				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
-				bot.Send(msg)
 
-			case "Поддержка":
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Напишите @SupportBot для помощи.")
-				bot.Send(msg)
-			}
-		}
-
-		// Обработка нажатий на inline-кнопки
-		if update.CallbackQuery != nil {
-			callback := update.CallbackQuery
-			chatID := callback.Message.Chat.ID
-			var response string
-
-			switch callback.Data {
 			case "top_up_balance":
 				response = "Функция пополнения баланса пока в разработке! 💸"
+				msg = tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					),
+				)
+
 			case "referral_system":
 				response = "Реферальная система: пригласите друга и получите бонус! 🤑"
+				msg = tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					),
+				)
+
 			case "purchase_history":
 				// Получаем историю покупок
-				userID := callback.From.ID
 				history, err := db.GetPurchaseHistory(userID)
 				if err != nil {
 					log.Println("Failed to get purchase history:", err)
@@ -176,8 +273,22 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 						}
 					}
 				}
+				msg = tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					),
+				)
+
 			case "activate_coupon":
 				response = "Введите код купона для активации! 📜"
+				msg = tgbotapi.NewMessage(chatID, response)
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					),
+				)
+
 			default:
 				// Обработка нажатия на кнопку товара
 				if strings.HasPrefix(callback.Data, "good_") {
@@ -204,6 +315,13 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 							}
 						}
 					}
+					msg = tgbotapi.NewMessage(chatID, response)
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+						),
+					)
+
 				} else if strings.HasPrefix(callback.Data, "service_") {
 					// Обработка нажатия на кнопку услуги
 					serviceIDStr := strings.TrimPrefix(callback.Data, "service_")
@@ -229,14 +347,32 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 							}
 						}
 					}
+					msg = tgbotapi.NewMessage(chatID, response)
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+						),
+					)
+
 				} else {
 					response = "Неизвестное действие."
+					msg = tgbotapi.NewMessage(chatID, response)
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+						),
+					)
 				}
 			}
 
 			// Отправляем ответ на нажатие кнопки
-			msg := tgbotapi.NewMessage(chatID, response)
-			bot.Send(msg)
+			sentMsg, err := bot.Send(msg)
+			if err != nil {
+				log.Println("Failed to send message:", err)
+				continue
+			}
+			// Сохраняем ID нового сообщения
+			state.lastMessageID = sentMsg.MessageID
 
 			// Подтверждаем обработку callback
 			callbackConfig := tgbotapi.NewCallback(callback.ID, "")
@@ -245,15 +381,14 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 	}
 }
 
-func clientMenu() tgbotapi.ReplyKeyboardMarkup {
-	return tgbotapi.NewReplyKeyboard(
-		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton("Товары"),
-			tgbotapi.NewKeyboardButton("Профиль"),
+func clientMenu() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🛒 Каталог", "catalog"),
 		),
-		tgbotapi.NewKeyboardButtonRow(
-			tgbotapi.NewKeyboardButton("Услуги"),
-			tgbotapi.NewKeyboardButton("Поддержка"),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👤 Профиль", "profile"),
+			tgbotapi.NewInlineKeyboardButtonData("ℹ Информация", "info"),
 		),
 	)
 }
