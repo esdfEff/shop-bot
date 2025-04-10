@@ -3,19 +3,43 @@ package handlers
 import (
 	"fmt"
 	"log"
+	"shop-bot/config"
+	"shop-bot/cryptopay"
 	"shop-bot/db"
 	"shop-bot/models"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+// Поддерживаемые криптовалюты
+var supportedAssets = []string{"TON", "BTC", "ETH", "USDT", "USDC"}
+
+// Переменная для хранения состояния пополнения баланса
+type topUpState struct {
+	userID      int64
+	asset       string
+	amountStep  bool
+	waitingList map[int64]bool // Map для отслеживания пользователей, ожидающих обновления статуса платежа
+}
+
+var topUpStates = make(map[int64]*topUpState)
+var cryptoClient *cryptopay.CryptoPayClient
 
 func HandleClientBot(bot *tgbotapi.BotAPI) {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
 	updates := bot.GetUpdatesChan(u)
+
+	// Инициализация клиента Crypto Pay
+	cfg := config.LoadConfig()
+	cryptoClient = cryptopay.NewCryptoPayClient(cfg.CryptoPayToken)
+
+	// Запуск горутины для проверки статуса платежей
+	go checkPaymentStatus(bot)
 
 	// Переменная для хранения состояния
 	type clientState struct {
@@ -24,11 +48,62 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 	state := clientState{}
 
 	for update := range updates {
-		// Обработка текстовых сообщений
 		if update.Message != nil {
 			userID := update.Message.From.ID
-			nameTag := update.Message.From.UserName
 			chatID := update.Message.Chat.ID
+
+			// Обработка текстовых сообщений
+			// Проверяем, ожидаем ли от пользователя ввод суммы для пополнения
+			if state, exists := topUpStates[userID]; exists && state.amountStep {
+				amount, err := strconv.ParseFloat(update.Message.Text, 64)
+				if err != nil || amount <= 0 {
+					msg := tgbotapi.NewMessage(chatID, "Пожалуйста, введите корректную сумму (например, 100.50).")
+					bot.Send(msg)
+					continue
+				}
+
+				// Создаем инвойс в Crypto Pay
+				invoice, err := createCryptoInvoice(userID, amount, state.asset)
+				if err != nil {
+					log.Printf("Failed to create invoice: %v", err)
+					msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка создания счета: %v", err))
+					bot.Send(msg)
+					continue
+				}
+
+				// Сохраняем информацию о платеже в базе данных
+				if err := db.CreatePayment(userID, invoice.InvoiceID, amount, state.asset, "active", "top_up", invoice.CreatedAt); err != nil {
+					log.Printf("Failed to save payment: %v", err)
+				}
+
+				// Отправляем пользователю ссылку на оплату
+				responseText := fmt.Sprintf(
+					"Создан счет на %.2f %s\n\n"+
+						"Счет действителен 30 минут. Оплатите его, перейдя по ссылке ниже.",
+					invoice.Amount, invoice.Asset)
+
+				msg := tgbotapi.NewMessage(chatID, responseText)
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonURL("Оплатить", invoice.PayUrl),
+					),
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Проверить платеж", fmt.Sprintf("check_payment_%d", invoice.InvoiceID)),
+					),
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+					),
+				)
+				bot.Send(msg)
+
+				// Добавляем пользователя в список ожидающих проверки
+				state.waitingList[userID] = true
+				state.amountStep = false
+
+				continue
+			}
+
+			nameTag := update.Message.From.UserName
 
 			// Добавляем пользователя в базу
 			if err := db.AddUser(models.User{ID: userID, NameTag: nameTag}); err != nil {
@@ -90,7 +165,93 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 			}
 
 			switch callback.Data {
+			// Проверяем, связан ли callback с платежом
+			case "check_payment_":
+				if strings.HasPrefix(callback.Data, "check_payment_") {
+					invoiceIDStr := strings.TrimPrefix(callback.Data, "check_payment_")
+					invoiceID, err := strconv.ParseInt(invoiceIDStr, 10, 64)
+					if err != nil {
+						response = "Ошибка: неверный ID платежа."
+						msg = tgbotapi.NewMessage(chatID, response)
+					} else {
+						// Проверяем статус платежа
+						status, err := checkCryptoInvoiceStatus(invoiceID, userID)
+						if err != nil {
+							response = fmt.Sprintf("Ошибка при проверке платежа: %v", err)
+						} else if status == "paid" {
+							response = "Платеж успешно завершен! Ваш баланс обновлен."
+						} else {
+							response = "Платеж еще не получен. Пожалуйста, завершите оплату и повторите проверку."
+						}
+						msg = tgbotapi.NewMessage(chatID, response)
+						msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+							tgbotapi.NewInlineKeyboardRow(
+								tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+							),
+						)
+					}
+					sentMsg, err := bot.Send(msg)
+					if err != nil {
+						log.Println("Failed to send message:", err)
+					}
+					state.lastMessageID = sentMsg.MessageID
+
+					// Подтверждаем обработку callback
+					callbackConfig := tgbotapi.NewCallback(callback.ID, "")
+					bot.Send(callbackConfig)
+					continue
+				}
+
+			// Проверяем, связан ли callback с выбором криптовалюты
+			case "asset_":
+				if strings.HasPrefix(callback.Data, "asset_") {
+					asset := strings.TrimPrefix(callback.Data, "asset_")
+
+					// Проверяем, поддерживается ли эта криптовалюта
+					assetSupported := false
+					for _, supportedAsset := range supportedAssets {
+						if asset == supportedAsset {
+							assetSupported = true
+							break
+						}
+					}
+
+					if !assetSupported {
+						response = "Выбранная криптовалюта не поддерживается."
+						msg = tgbotapi.NewMessage(chatID, response)
+					} else {
+						// Сохраняем выбранную криптовалюту и переходим к следующему шагу
+						if _, exists := topUpStates[userID]; !exists {
+							topUpStates[userID] = &topUpState{
+								userID:      userID,
+								waitingList: make(map[int64]bool),
+							}
+						}
+						topUpStates[userID].asset = asset
+						topUpStates[userID].amountStep = true
+
+						response = fmt.Sprintf("Вы выбрали %s для пополнения баланса. Введите сумму для пополнения:", asset)
+						msg = tgbotapi.NewMessage(chatID, response)
+					}
+
+					sentMsg, err := bot.Send(msg)
+					if err != nil {
+						log.Println("Failed to send message:", err)
+					}
+					state.lastMessageID = sentMsg.MessageID
+
+					// Подтверждаем обработку callback
+					callbackConfig := tgbotapi.NewCallback(callback.ID, "")
+					bot.Send(callbackConfig)
+					continue
+				}
+
 			case "back_to_menu":
+				// Сбрасываем состояние пользователя при возврате в меню
+				if _, exists := topUpStates[userID]; exists {
+					delete(topUpStates, userID)
+				}
+
 				// Возвращаемся к главному меню
 				response = "Добро пожаловать в магазин! Выберите опцию:"
 				msg = tgbotapi.NewMessage(chatID, response)
@@ -237,13 +398,23 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 				}
 
 			case "top_up_balance":
-				response = "Функция пополнения баланса пока в разработке! 💸"
+				response = "Выберите криптовалюту для пополнения баланса:"
+
+				// Создаем кнопки для выбора криптовалюты
+				var rows [][]tgbotapi.InlineKeyboardButton
+				for _, asset := range supportedAssets {
+					rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData(asset, "asset_"+asset),
+					))
+				}
+
+				// Добавляем кнопку "Назад"
+				rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
+				))
+
 				msg = tgbotapi.NewMessage(chatID, response)
-				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-					tgbotapi.NewInlineKeyboardRow(
-						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
-					),
-				)
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 
 			case "referral_system":
 				response = "Реферальная система: пригласите друга и получите бонус! 🤑"
@@ -288,8 +459,50 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 						tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
 					),
 				)
-
 			default:
+				// Обработка выбора криптовалюты
+				if strings.HasPrefix(callback.Data, "asset_") {
+					asset := strings.TrimPrefix(callback.Data, "asset_")
+
+					// Проверяем, поддерживается ли эта криптовалюта
+					assetSupported := false
+					for _, supportedAsset := range supportedAssets {
+						if asset == supportedAsset {
+							assetSupported = true
+							break
+						}
+					}
+
+					if !assetSupported {
+						response = "Выбранная криптовалюта не поддерживается."
+						msg = tgbotapi.NewMessage(chatID, response)
+					} else {
+						// Сохраняем выбранную криптовалюту и переходим к следующему шагу
+						if _, exists := topUpStates[userID]; !exists {
+							topUpStates[userID] = &topUpState{
+								userID:      userID,
+								waitingList: make(map[int64]bool),
+							}
+						}
+						topUpStates[userID].asset = asset
+						topUpStates[userID].amountStep = true
+
+						response = fmt.Sprintf("Вы выбрали %s для пополнения баланса. Введите сумму для пополнения:", asset)
+						msg = tgbotapi.NewMessage(chatID, response)
+					}
+
+					sentMsg, err := bot.Send(msg)
+					if err != nil {
+						log.Println("Failed to send message:", err)
+					}
+					state.lastMessageID = sentMsg.MessageID
+
+					// Подтверждаем обработку callback
+					callbackConfig := tgbotapi.NewCallback(callback.ID, "")
+					bot.Send(callbackConfig)
+					continue
+				}
+
 				// Обработка нажатия на кнопку товара
 				if strings.HasPrefix(callback.Data, "good_") {
 					goodIDStr := strings.TrimPrefix(callback.Data, "good_")
@@ -321,7 +534,6 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 							tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
 						),
 					)
-
 				} else if strings.HasPrefix(callback.Data, "service_") {
 					// Обработка нажатия на кнопку услуги
 					serviceIDStr := strings.TrimPrefix(callback.Data, "service_")
@@ -353,7 +565,6 @@ func HandleClientBot(bot *tgbotapi.BotAPI) {
 							tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "back_to_menu"),
 						),
 					)
-
 				} else {
 					response = "Неизвестное действие."
 					msg = tgbotapi.NewMessage(chatID, response)
@@ -391,4 +602,107 @@ func clientMenu() tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("ℹ Информация", "info"),
 		),
 	)
+}
+
+// Функция для создания инвойса в Crypto Pay
+func createCryptoInvoice(userID int64, amount float64, asset string) (*cryptopay.Invoice, error) {
+	params := cryptopay.CreateInvoiceParams{
+		Asset:         asset,
+		Amount:        amount,
+		Description:   fmt.Sprintf("Пополнение баланса пользователя %d", userID),
+		Payload:       fmt.Sprintf("user_id:%d", userID),
+		AllowComments: true,
+		ExpiresIn:     1800,
+		PaidBtnName:   "openBot", // Используем допустимое значение
+		PaidBtnUrl:    "https://t.me/your_bot_name",
+	}
+
+	invoice, err := cryptoClient.CreateInvoice(params)
+	if err != nil {
+		return nil, err
+	}
+
+	return invoice, nil
+}
+
+// Функция для проверки статуса инвойса
+func checkCryptoInvoiceStatus(invoiceID int64, userID int64) (string, error) {
+	invoice, err := cryptoClient.GetInvoice(invoiceID)
+	if err != nil {
+		return "", err
+	}
+
+	// Обновляем статус платежа в базе данных
+	if invoice.Status != "active" {
+		db.UpdatePaymentStatus(invoiceID, invoice.Status)
+	}
+
+	// Если платеж оплачен, но баланс еще не обновлен
+	if invoice.Status == "paid" {
+		payment, err := db.GetPaymentByInvoiceID(invoiceID)
+		if err == nil && payment.Status != "paid" {
+			// Получаем текущий баланс
+			currentBalance, err := db.GetUserBalance(userID)
+			if err == nil {
+				// Обновляем баланс пользователя
+				newBalance := currentBalance + payment.Amount
+				db.UpdateUserBalance(userID, newBalance)
+
+				// Обновляем статус платежа
+				db.UpdatePaymentStatus(invoiceID, "paid")
+			}
+		}
+	}
+
+	return invoice.Status, nil
+}
+
+// Горутина для периодической проверки статуса платежей
+func checkPaymentStatus(bot *tgbotapi.BotAPI) {
+	for {
+		time.Sleep(30 * time.Second)
+
+		// Проверяем все активные платежи
+		for userID, state := range topUpStates {
+			if len(state.waitingList) == 0 {
+				continue
+			}
+
+			// Получаем платежи пользователя
+			payments, err := db.GetUserPayments(userID)
+			if err != nil {
+				log.Printf("Failed to get payments for user %d: %v", userID, err)
+				continue
+			}
+
+			for _, payment := range payments {
+				// Проверяем только активные платежи
+				if payment.Status != "active" {
+					continue
+				}
+
+				// Проверяем статус платежа
+				status, err := checkCryptoInvoiceStatus(payment.InvoiceID, userID)
+				if err != nil {
+					log.Printf("Failed to check payment status: %v", err)
+					continue
+				}
+
+				// Если платеж был оплачен, отправляем уведомление пользователю
+				if status == "paid" {
+					msg := tgbotapi.NewMessage(userID, fmt.Sprintf(
+						"✅ Ваш платеж на сумму %.2f %s успешно обработан! Баланс обновлен.",
+						payment.Amount, payment.Asset))
+
+					_, err := bot.Send(msg)
+					if err != nil {
+						log.Printf("Failed to send notification: %v", err)
+					}
+
+					// Удаляем пользователя из списка ожидающих
+					delete(state.waitingList, userID)
+				}
+			}
+		}
+	}
 }

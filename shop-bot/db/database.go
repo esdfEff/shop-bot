@@ -39,6 +39,17 @@ func InitDB() error {
 			value REAL,
 			descr TEXT
 		);
+		CREATE TABLE IF NOT EXISTS payments (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER,
+			invoice_id INTEGER,
+			amount REAL,
+			asset TEXT,
+			status TEXT,
+			created_at INTEGER,
+			purpose TEXT,
+			FOREIGN KEY (user_id) REFERENCES users(id)
+		);
 	`)
 	return err
 }
@@ -214,4 +225,54 @@ func AddToPurchaseHistory(userID int64, goodID int) error {
 		fmt.Println("Error updating history in AddToPurchaseHistory:", err)
 	}
 	return err
+}
+
+// Функции для работы с платежами
+func CreatePayment(userID int64, invoiceID int64, amount float64, asset, status, purpose string, createdAt int64) error {
+	_, err := DB.Exec("INSERT INTO payments (user_id, invoice_id, amount, asset, status, created_at, purpose) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		userID, invoiceID, amount, asset, status, createdAt, purpose)
+	if err != nil {
+		fmt.Println("Error creating payment:", err)
+	}
+	return err
+}
+
+func UpdatePaymentStatus(invoiceID int64, status string) error {
+	_, err := DB.Exec("UPDATE payments SET status = ? WHERE invoice_id = ?", status, invoiceID)
+	if err != nil {
+		fmt.Println("Error updating payment status:", err)
+	}
+	return err
+}
+
+func GetPaymentByInvoiceID(invoiceID int64) (*models.Payment, error) {
+	payment := &models.Payment{}
+	err := DB.QueryRow("SELECT id, user_id, invoice_id, amount, asset, status, created_at, purpose FROM payments WHERE invoice_id = ?", invoiceID).
+		Scan(&payment.ID, &payment.UserID, &payment.InvoiceID, &payment.Amount, &payment.Asset, &payment.Status, &payment.CreatedAt, &payment.Purpose)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("payment not found")
+		}
+		fmt.Println("Error getting payment:", err)
+		return nil, err
+	}
+	return payment, nil
+}
+
+func GetUserPayments(userID int64) ([]models.Payment, error) {
+	rows, err := DB.Query("SELECT id, user_id, invoice_id, amount, asset, status, created_at, purpose FROM payments WHERE user_id = ? ORDER BY created_at DESC", userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var payments []models.Payment
+	for rows.Next() {
+		var p models.Payment
+		if err := rows.Scan(&p.ID, &p.UserID, &p.InvoiceID, &p.Amount, &p.Asset, &p.Status, &p.CreatedAt, &p.Purpose); err != nil {
+			return nil, err
+		}
+		payments = append(payments, p)
+	}
+	return payments, nil
 }
